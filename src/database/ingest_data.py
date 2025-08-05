@@ -8,27 +8,27 @@ encodes both the subject identifier and the start time of the session.
 
 The database schema is intentionally simple and flexible:
 
-* **experiments** - high-level grouping of animals. Each experiment has a
+* **experiments** – high‑level grouping of animals. Each experiment has a
   unique name. Experiments are created on the fly when encountering
   previously unseen experiment names in the mapping file.
 
-* **treatments** - within an experiment, animals can belong to different
+* **treatments** – within an experiment, animals can belong to different
   treatment groups. The mapping file specifies which treatment each
   subject received. Treatments are unique per experiment.
 
-* **animals** - every subject is registered under a particular
+* **animals** – every subject is registered under a particular
   experiment and treatment. An entry in the ``animals`` table ensures
   uniqueness of each animal within an experiment.
 
-* **sessions** - a single CSV file corresponds to a single session. A
+* **sessions** – a single CSV file corresponds to a single session. A
   session is uniquely identified by a combination of ``animal_id`` and
   the timestamp parsed from the filename. The ``sessions`` table stores
   metadata about the session, including a reference back to the animal,
   the experiment, and the original filename.
 
-* **trials** - each row of the CSV file is inserted into the ``trials``
+* **trials** – each row of the CSV file is inserted into the ``trials``
   table. Trials reference their parent session via ``session_id``. To
-  keep the schema lightweight and future-proof, only a handful of
+  keep the schema lightweight and future‑proof, only a handful of
   frequently used fields are stored in dedicated columns. The full
   original row is preserved as a JSON blob in the ``data_json`` column.
 
@@ -77,7 +77,7 @@ def parse_filename(filename: str) -> Tuple[str, datetime]:
     Filenames are expected to follow the convention
     ``P<animal_id>_<YYYY>_<MM>_<DD>_<HH>_<MM>_<SS>.csv``. For example
     ``P4677_2024_10_06_12_37_31.csv`` corresponds to subject ``P4677``
-    starting at 2024-10-06 12:37:31.
+    starting at 2024‑10‑06 12:37:31.
 
     Args:
         filename: Name of the CSV file.
@@ -93,7 +93,7 @@ def parse_filename(filename: str) -> Tuple[str, datetime]:
     base = os.path.basename(filename)
     # Accept filenames of the form
     #   P####_YYYY_MM_DD_HH_MM_SS.csv
-    # There should be seven underscore-separated segments: the subject
+    # There should be seven underscore‑separated segments: the subject
     # identifier and six time components (year, month, day, hour,
     # minute, second). The regular expression captures the subject
     # number and each component separately.
@@ -111,32 +111,59 @@ def parse_filename(filename: str) -> Tuple[str, datetime]:
 
 
 def load_mapping_file(path: str) -> Dict[str, MappingEntry]:
-    """Load the experiment and treatment assignments from a CSV file.
+    """Load the experiment and treatment assignments from a mapping file.
 
-    The mapping CSV must contain at least three columns: ``experiment``,
-    ``animal_id`` and ``treatment``. Leading/trailing whitespace on
-    values is stripped. Additional columns are ignored.
+    The file can be comma‑separated or tab‑separated. It must contain at
+    least three columns: ``experiment``, ``animal_id`` and ``treatment``.
+    Values are stripped of leading/trailing whitespace. Additional
+    columns are ignored.
 
     Args:
-        path: Path to the mapping CSV file.
+        path: Path to the mapping file.
 
     Returns:
         A dictionary keyed by ``animal_id`` with values containing
         ``experiment`` and ``treatment`` assignments.
+
+    Raises:
+        ValueError: if the required columns are not present.
     """
     mapping: Dict[str, MappingEntry] = {}
+    # Attempt to detect delimiter (comma or tab) using the csv.Sniffer.
     with open(path, newline='') as f:
-        reader = csv.DictReader(f)
+        sample = f.read(2048)
+        f.seek(0)
+        # Default dialect is comma; attempt to sniff delimiters
+        delim = ','
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',\t')
+            delim = dialect.delimiter
+        except Exception:
+            # fallback: if header contains tabs, assume tab delimiter
+            if '\t' in sample.splitlines()[0]:
+                delim = '\t'
+        reader = csv.DictReader(f, delimiter=delim)
         required = {"experiment", "animal_id", "treatment"}
-        missing = required - set(reader.fieldnames or [])
+        if reader.fieldnames is None:
+            raise ValueError("Mapping file appears empty or invalid.")
+        missing = required - set([h.strip() for h in reader.fieldnames])
         if missing:
             raise ValueError(
                 f"Mapping file is missing required columns: {', '.join(sorted(missing))}"
             )
         for row in reader:
-            animal = row["animal_id"].strip()
-            experiment = row["experiment"].strip()
-            treatment = row["treatment"].strip()
+            # Normalise keys by stripping whitespace
+            # Some mapping files might include extra whitespace around
+            # column names. Use row.get rather than direct indexing to
+            # avoid KeyError.
+            animal = row.get("animal_id")
+            experiment = row.get("experiment")
+            treatment = row.get("treatment")
+            if animal is None or experiment is None or treatment is None:
+                continue
+            animal = animal.strip()
+            experiment = experiment.strip()
+            treatment = treatment.strip()
             mapping[animal] = MappingEntry(experiment=experiment, treatment=treatment)
     return mapping
 
@@ -184,12 +211,20 @@ def init_database(conn: sqlite3.Connection) -> None:
             experiment_id INTEGER NOT NULL,
             session_datetime TEXT NOT NULL,
             file_name TEXT NOT NULL,
+            ses_num INTEGER NOT NULL,
             UNIQUE(animal_id, session_datetime),
             FOREIGN KEY(animal_id) REFERENCES animals(id) ON DELETE CASCADE,
             FOREIGN KEY(experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
         );
         """
     )
+    # If the sessions table pre‑exists from a previous version without
+    # the ses_num column, attempt to add it. The ALTER TABLE will fail
+    # silently if the column already exists.
+    try:
+        cur.execute("ALTER TABLE sessions ADD COLUMN ses_num INTEGER")
+    except sqlite3.OperationalError:
+        pass
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS trials (
@@ -279,12 +314,21 @@ def insert_session(
     file_name: str,
 ) -> int:
     cur = conn.cursor()
+    # Determine the next session number for this animal. Sessions are
+    # numbered sequentially in chronological order per animal, starting
+    # from 1. Use the existing maximum to assign the next number.
+    cur.execute(
+        "SELECT MAX(ses_num) FROM sessions WHERE animal_id = ?",
+        (animal_db_id,),
+    )
+    row = cur.fetchone()
+    next_num = (row[0] or 0) + 1
     cur.execute(
         """
-        INSERT INTO sessions (animal_id, experiment_id, session_datetime, file_name)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sessions (animal_id, experiment_id, session_datetime, file_name, ses_num)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (animal_db_id, experiment_id, dt.isoformat(), file_name),
+        (animal_db_id, experiment_id, dt.isoformat(), file_name, next_num),
     )
     conn.commit()
     return cur.lastrowid
@@ -379,13 +423,28 @@ def ingest_folder(
         animal_db_id = get_or_create_animal(conn, animal_id, experiment_id, treatment_id)
         # check duplicate session
         if session_exists(conn, animal_db_id, dt):
-            print(f"Session for {animal_id} at {dt} already exists - skipping {fname}.")
+            print(f"Session for {animal_id} at {dt} already exists – skipping {fname}.")
             continue
         # insert session record
         session_id = insert_session(conn, animal_db_id, experiment_id, dt, fname)
-        # read CSV data
+        # read CSV data with robust encoding handling. Default to UTF‑8
+        # and fall back to Latin‑1 (ISO‑8859‑1) if decoding fails. If
+        # reading still fails for any other reason, report the file and
+        # continue without aborting the ingestion process.
         csv_path = os.path.join(folder, fname)
-        df = pd.read_csv(csv_path)
+        try:
+            try:
+                df = pd.read_csv(csv_path)
+            except UnicodeDecodeError:
+                df = pd.read_csv(csv_path, encoding='ISO-8859-1')
+        except Exception as exc:
+            print(f"Failed to read {fname}: {exc}. Skipping this file.")
+            # Remove the session record we just inserted since we can't
+            # populate trials for it
+            cur = conn.cursor()
+            cur.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+            continue
         insert_trials(conn, session_id, df)
         print(f"Imported {fname} (session_id={session_id})")
     conn.close()
