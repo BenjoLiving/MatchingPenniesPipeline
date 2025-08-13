@@ -1,3 +1,36 @@
+"""
+StudyDataset: hierarchical loader/aggregator for Matching Pennies datasets.
+
+This module organizes data as:
+    StudyDataset
+      └── Experiment (e.g., "PFC_lesion")
+          └── Paradigm (e.g., "normal", "hallway_swap")
+              └── Animal (e.g., "P4637")
+                  └── Session (CSV → DataFrame)
+
+Key features
+------------
+- Dot-notation access at each level (e.g., study.PFC_lesion.normal.P4637).
+- Robust CSV reading with engine/encoding fallbacks; logs & skips unreadable files.
+- Optional treatment map integration (accepts many header variants).
+- One-liner aggregation to a single DataFrame with metadata columns.
+
+Quickstart
+----------
+>>> study = StudyDataset.from_roots(
+...     roots=[
+...         ("PFC_lesion", "normal", "/path/to/normal_mp"),
+...         ("PFC_lesion", "hallway_swap", "/path/to/switching_halls"),
+...     ],
+...     animal_treatment_map_csv="/path/to/animal_important_dates_csv.csv",
+...     filename_regex=r"(?P<animal>P\\d{4,})_(?P<date>\\d{4}_\\d{2}_\\d{2}).*\\.csv$",
+...     low_memory=False,  # honored for C-engine, auto-dropped for Python engine
+... )
+>>> df = study.all_trials(experiment="PFC_lesion", paradigm="normal")
+>>> df.columns
+Index([... '_experiment','_paradigm','_animal','_treatment','_session_idx','_trial_idx', ...])
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +43,28 @@ import pandas as pd
 # =============================
 
 def _safe_attr(name: str, existing: dict) -> str:
-    """Return a valid, non-colliding attribute name for dot-notation."""
+    """
+    Produce a valid, non-colliding Python attribute name for dot-notation.
+
+    Parameters
+    ----------
+    name : str
+        The desired attribute name (e.g., "P4637" or "hallway-swap").
+    existing : dict
+        The target object's __dict__ used to avoid collisions.
+
+    Returns
+    -------
+    str
+        A sanitized attribute name that is a valid identifier and does not
+        exist in `existing`.
+
+    Notes
+    -----
+    - Non-word characters are replaced with underscores.
+    - If the name starts with a digit, it is prefixed with 'n_'.
+    - If there is still a collision, a numeric suffix (_2, _3, ...) is added.
+    """
     if name.isidentifier() and name not in existing:
         return name
     alias = re.sub(r"\W", "_", name)
@@ -22,17 +76,43 @@ def _safe_attr(name: str, existing: dict) -> str:
         i += 1
     return base
 
+
 def _norm(s: str) -> str:
-    """Normalize header names: 'Animal ID' -> 'animalid' (lower, strip non-alnum)."""
+    """
+    Normalize header names for tolerant column matching.
+
+    Examples
+    --------
+    >>> _norm("Animal ID")
+    'animalid'
+    >>> _norm("Lesion Group")
+    'lesiongroup'
+    """
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
+
 def _find_col(cols: Iterable[str], candidates_norm: List[str]) -> Optional[str]:
-    """Return original column name matching any normalized candidate."""
+    """
+    Find a column in `cols` whose normalized form matches any candidate.
+
+    Parameters
+    ----------
+    cols : Iterable[str]
+        Column names to search.
+    candidates_norm : list[str]
+        Candidate *normalized* names (e.g., ['animalid','animal','id']).
+
+    Returns
+    -------
+    Optional[str]
+        The original column name if found, else None.
+    """
     nmap = {_norm(c): c for c in cols}
     for cand in candidates_norm:
         if cand in nmap:
             return nmap[cand]
     return None
+
 
 def _read_csv_robust(
     path: str | Path,
@@ -41,8 +121,27 @@ def _read_csv_robust(
     **kwargs,
 ) -> Optional[pd.DataFrame]:
     """
-    Try multiple engines and encodings. Skips unsupported kwargs per engine.
-    Returns a DataFrame or None if all attempts fail.
+    Read a CSV with multiple engine/encoding fallbacks.
+
+    Tries combinations of pandas engines and encodings; drops options that are
+    not supported by a given engine (e.g., 'low_memory' for the Python engine).
+    If all attempts fail, returns None (caller can log & skip).
+
+    Parameters
+    ----------
+    path : str | Path
+        CSV file path.
+    engine_preference : tuple[str, ...], optional
+        Engines to try in order. Default ("c", "python").
+    encodings : tuple[Optional[str], ...], optional
+        Encodings to try in order. Default includes UTF-8, latin-1, etc.
+    **kwargs
+        Extra pandas.read_csv kwargs, forwarded per attempt.
+
+    Returns
+    -------
+    Optional[pandas.DataFrame]
+        The loaded DataFrame, or None if every attempt failed.
     """
     for eng in engine_preference:
         # copy kwargs and drop options not supported by this engine
@@ -71,34 +170,77 @@ def _read_csv_robust(
                 continue
     return None
 
+
 # =============================
 # Core containers
 # =============================
 
 @dataclass
 class Session:
-    """One session worth of trials."""
+    """
+    A single recording session (one CSV → one DataFrame) for an animal.
+
+    Attributes
+    ----------
+    animal_id : str
+        Animal identifier (e.g., 'P4637').
+    path : pathlib.Path
+        File path to the loaded CSV.
+    df : pandas.DataFrame
+        Trials table for this session.
+    session_num : int | None
+        1-based index *within the animal and paradigm*. Set by loader.
+    date : str | None
+        Optional date extracted from the filename via `filename_regex`.
+    """
     animal_id: str
     path: Path
     df: pd.DataFrame
     session_num: Optional[int] = None   # within animal & paradigm
     date: Optional[str] = None          # optional from filename
 
+
 @dataclass
 class Animal:
-    """All sessions for one animal."""
+    """
+    Container for all sessions belonging to a single animal.
+
+    Attributes
+    ----------
+    animal_id : str
+        Identifier (e.g., 'P4637').
+    sessions : list[Session]
+        All sessions for this animal in the given paradigm.
+    treatment : str | None
+        Treatment/group label (e.g., 'sham', 'mPFC', 'OFC') if provided via map.
+    """
     animal_id: str
     sessions: List[Session] = field(default_factory=list)
     treatment: Optional[str] = None     # set from treatment map CSV
 
     def __iter__(self) -> Iterator[Session]:
+        """Iterate over Session objects."""
         return iter(self.sessions)
 
     def __len__(self) -> int:
+        """Number of sessions for this animal."""
         return len(self.sessions)
 
     def concat(self, sort: bool = False) -> pd.DataFrame:
-        """All trials across this animal's sessions (adds animal/session idx)."""
+        """
+        Concatenate trials across this animal's sessions.
+
+        Parameters
+        ----------
+        sort : bool, optional
+            Forwarded to pandas.concat(sort=...), by default False.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Concatenated DataFrame with helper columns:
+            `_animal` and `_session_idx` (per-animal).
+        """
         if not self.sessions:
             return pd.DataFrame()
         return pd.concat(
@@ -107,33 +249,71 @@ class Animal:
             ignore_index=True, sort=sort
         )
 
+
 @dataclass
 class Paradigm:
-    """A paradigm inside an experiment (e.g., 'normal', 'hallway_swap')."""
+    """
+    A paradigm inside an experiment (e.g., 'normal', 'hallway_swap').
+
+    Attributes
+    ----------
+    name : str
+        Paradigm name.
+    animals : dict[str, Animal]
+        Mapping of animal_id → Animal.
+    """
     name: str
     animals: Dict[str, Animal] = field(default_factory=dict)
 
     def __iter__(self) -> Iterator[Animal]:
+        """Iterate over Animal objects."""
         return iter(self.animals.values())
 
     def __getitem__(self, animal_id: str) -> Animal:
+        """Dict-style access to animals by ID."""
         return self.animals[animal_id]
+
 
 @dataclass
 class Experiment:
-    """A single experiment (e.g., 'PFC_lesion')."""
+    """
+    A single experiment grouping multiple paradigms (e.g., 'PFC_lesion').
+
+    Attributes
+    ----------
+    name : str
+        Experiment name.
+    paradigms : dict[str, Paradigm]
+        Mapping of paradigm name → Paradigm.
+    """
     name: str
     paradigms: Dict[str, Paradigm] = field(default_factory=dict)
 
     def __iter__(self) -> Iterator[Paradigm]:
+        """Iterate over Paradigm objects."""
         return iter(self.paradigms.values())
 
     def __getitem__(self, paradigm_name: str) -> Paradigm:
+        """Dict-style access to paradigms by name."""
         return self.paradigms[paradigm_name]
+
 
 @dataclass
 class StudyDataset:
-    """Root container for many experiments & paradigms with dot access."""
+    """
+    Root container for many experiments & paradigms with dot-notation access.
+
+    Attributes
+    ----------
+    experiments : dict[str, Experiment]
+        Mapping of experiment name → Experiment.
+    _attr_alias : dict[str, str]
+        Internal map of dot-notation attribute → true name (for reference).
+
+    Usage
+    -----
+    See module docstring or the `StudyDataset_Usage.md` guide.
+    """
     experiments: Dict[str, Experiment] = field(default_factory=dict)
     _attr_alias: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -142,18 +322,40 @@ class StudyDataset:
     def from_roots(
         cls,
         roots: List[Tuple[str, str, str | Path]],
-        # list of (experiment_name, paradigm_name, folder_path)
         filename_regex: str = r"(?P<animal>P\d{4,})_(?P<date>\d{4}_\d{2}_\d{2}).*\.csv$",
         animal_treatment_map_csv: Optional[str | Path] = None,
-        # `engine` retained for backwards-compat, but robust reader tries both C and Python engines
-        engine: Optional[str] = None,
+        engine: Optional[str] = None,  # kept for backward-compat; robust reader ignores it
         **read_csv_kwargs,
     ) -> "StudyDataset":
         """
-        Build a StudyDataset from multiple roots.
-        Each root is (experiment, paradigm, folder).
-        Optionally provide a treatment map CSV with columns like:
-          animal_id,treatment   (extra cols are fine)
+        Build a `StudyDataset` by scanning multiple roots (experiment, paradigm, folder).
+
+        Parameters
+        ----------
+        roots : list[tuple[str, str, str | Path]]
+            Each tuple is (experiment_name, paradigm_name, folder_path).
+        filename_regex : str, optional
+            Regex that must capture a named 'animal' group, and optionally a 'date' group
+            used for chronological session sorting. Defaults to:
+            r"(?P<animal>P\\d{4,})_(?P<date>\\d{4}_\\d{2}_\\d{2}).*\\.csv$"
+        animal_treatment_map_csv : str | Path | None, optional
+            Optional CSV containing animal IDs and treatment/group names. The loader
+            tolerates many header variants (e.g., 'Animal ID' ~ 'animalid', 'Group' ~ 'group').
+        engine : str | None, optional
+            Ignored by the robust reader; present for backward compatibility.
+        **read_csv_kwargs :
+            Extra keyword arguments forwarded to `pandas.read_csv`. They will be
+            applied robustly (unsupported options are dropped for the Python engine).
+
+        Returns
+        -------
+        StudyDataset
+            A populated StudyDataset with dot-notation access to experiments/paradigms/animals.
+
+        Notes
+        -----
+        - Files that fail all engine/encoding attempts are skipped with a warning.
+        - Session numbering (`session_num`) is per-animal **within each paradigm**.
         """
         study = cls()
 
@@ -188,19 +390,22 @@ class StudyDataset:
         # load each (experiment, paradigm, folder)
         for exp_name, par_name, folder in roots:
             folder = Path(folder)
+
+            # add/get experiment with dot access
             exp = study.experiments.get(exp_name)
             if exp is None:
                 exp = Experiment(name=exp_name)
-                # dot access: ds.<experiment>
-                setattr(study, _safe_attr(exp_name, study.__dict__), exp)
-                study._attr_alias[_safe_attr(exp_name, study.__dict__)] = exp_name
+                attr = _safe_attr(exp_name, study.__dict__)
+                setattr(study, attr, exp)
+                study._attr_alias[attr] = exp_name
                 study.experiments[exp_name] = exp
 
+            # add/get paradigm with dot access
             paradigm = exp.paradigms.get(par_name)
             if paradigm is None:
                 paradigm = Paradigm(name=par_name)
-                # dot access: ds.<experiment>.<paradigm>
-                setattr(exp, _safe_attr(par_name, getattr(exp, "__dict__", {})), paradigm)
+                attr = _safe_attr(par_name, getattr(exp, "__dict__", {}))
+                setattr(exp, attr, paradigm)
                 exp.paradigms[par_name] = paradigm
 
             # discover files and group by animal
@@ -220,8 +425,8 @@ class StudyDataset:
                 animal = paradigm.animals.get(animal_id)
                 if animal is None:
                     animal = Animal(animal_id=animal_id, treatment=treatment_map.get(animal_id))
-                    # dot access: ds.<experiment>.<paradigm>.<animal_id>
-                    setattr(paradigm, _safe_attr(animal_id, getattr(paradigm, "__dict__", {})), animal)
+                    attr = _safe_attr(animal_id, getattr(paradigm, "__dict__", {}))
+                    setattr(paradigm, attr, animal)
                     paradigm.animals[animal_id] = animal
 
                 # append sessions (session_num per animal *within this paradigm*)
@@ -246,7 +451,23 @@ class StudyDataset:
         paradigm: Optional[str] = None,
         treatment: Optional[str] = None,
     ) -> Iterator[Session]:
-        """Yield sessions filtered by experiment, paradigm, and/or treatment."""
+        """
+        Iterate over `Session` objects with optional filters.
+
+        Parameters
+        ----------
+        experiment : str | None, optional
+            Restrict to a particular experiment name.
+        paradigm : str | None, optional
+            Restrict to a particular paradigm name.
+        treatment : str | None, optional
+            Restrict to animals with a particular treatment label.
+
+        Yields
+        ------
+        Session
+            Matching sessions.
+        """
         exps = (
             [self.experiments[experiment]]
             if experiment else self.experiments.values()
@@ -271,9 +492,31 @@ class StudyDataset:
         sort: bool = False,
     ) -> pd.DataFrame:
         """
-        Concatenate all trials with metadata columns:
-        _experiment, _paradigm, _animal, _treatment,
-        _session_idx (per animal & paradigm), _trial_idx (within session).
+        Concatenate trials across the study (optionally filtered), adding metadata.
+
+        Parameters
+        ----------
+        experiment : str | None, optional
+            Restrict to a particular experiment.
+        paradigm : str | None, optional
+            Restrict to a particular paradigm.
+        treatment : str | None, optional
+            Restrict to a particular treatment/group label.
+        sort : bool, optional
+            Forwarded to pandas.concat(sort=...), default False.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Single table of trials with columns:
+            `_experiment`, `_paradigm`, `_animal`, `_treatment`,
+            `_session_idx` (per animal & paradigm),
+            `_trial_idx` (1-based within each session).
+
+        Notes
+        -----
+        - If the original DataFrames already contain any of these metadata names,
+          they are preserved as `*_orig` before the new columns are added.
         """
         frames = []
         exps = (
@@ -313,8 +556,9 @@ class StudyDataset:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True, sort=sort)
 
+
 # =============================
-# Example usage
+# Example usage (manual test)
 # =============================
 
 if __name__ == "__main__":
