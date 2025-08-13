@@ -1,0 +1,8 @@
+pyproject.toml
+src/database/DataFrameDataBase.py
+src/database/__init__.py
+src/database/ingest_data.py
+src/matching_pennies.egg-info/PKG-INFO
+src/matching_pennies.egg-info/SOURCES.txt
+src/matching_pennies.egg-info/dependency_links.txt
+src/matching_pennies.egg-info/top_level.txt
