@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 import re
 import pandas as pd
+from mp_metrics import *
 
 # =============================
 # Utilities
@@ -112,6 +113,16 @@ def _find_col(cols: Iterable[str], candidates_norm: List[str]) -> Optional[str]:
         if cand in nmap:
             return nmap[cand]
     return None
+
+# Normalize a header to compare case/whitespace-insensitively
+def _norm_name(s: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+def _resolve_col(df: pd.DataFrame, name: str) -> str | None:
+    """Return the actual df column whose normalized form matches `name` (ignoring spaces/case)."""
+    nmap = {_norm_name(c): c for c in df.columns}
+    return nmap.get(_norm_name(name))
 
 
 def _read_csv_robust(
@@ -436,6 +447,8 @@ class StudyDataset:
                     if df is None:
                         print(f"⚠️ Skipping file (failed all engine/encoding attempts): {path}")
                         continue
+                    # Clean headers: remove BOM, trim spaces
+                    df.rename(columns=lambda s: str(s).replace("\ufeff", "").strip(), inplace=True)
                     sess = Session(
                         animal_id=animal_id, path=path, df=df,
                         session_num=start_idx + offset, date=date
@@ -555,6 +568,119 @@ class StudyDataset:
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True, sort=sort)
+    
+    # ======= Trial-level annotators (return a DataFrame) =======
+
+    def annotate_reaction_response_times(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_reaction_response_times(df, **kw)
+
+    def annotate_inter_trial_intervals(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_inter_trial_intervals(df, **kw)
+
+    def annotate_num_rewards(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_num_rewards(df, **kw)
+
+    def annotate_high_value_well_from_bolus(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_high_value_well_from_bolus(df, **kw)
+
+    def annotate_block_id_by_bolus(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_block_id_by_bolus(df, **kw)
+
+    def annotate_block_id_by_prob(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return add_block_id_by_prob(df, **kw)
+
+    def filter_blocks_with_few_trials(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return delete_blocks_with_few_trials(df, **kw)
+
+    # ======= Session-level summaries (return one row per session) =======
+
+    def summarize_session_performance(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return summarize_session_performance(df, **kw)
+
+    def summarize_no_response_rate(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return summarize_no_response_rate(df, **kw)
+
+    def summarize_prob_right(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return summarize_prob_right(df, **kw)
+
+    def summarize_prob_repeat(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return summarize_prob_repeat(df, **kw)
+
+    def summarize_wsls(self, *, experiment=None, paradigm=None, treatment=None, **kw):
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+        return summarize_wsls(df, **kw)
+
+    def summarize_sessions(
+        self,
+        *,
+        experiment: str | None = None,
+        paradigm: str | None = None,
+        treatment: str | None = None,
+        prefer_wrong_flag: bool = False,
+        well_col: str = "Well_on_ts",
+        choice_col: str = "Well_id",
+        err_col: str = "Error_flg",
+    ) -> pd.DataFrame:
+        """
+        Convenience: merge several common summaries into one table.
+        Includes: performance, no-response, prob-right, prob-repeat, WSLS.
+        """
+        from mp_metrics import (
+            DEFAULT_SESSION_KEYS,
+            summarize_session_performance,
+            summarize_no_response_rate,
+            summarize_prob_right,
+            summarize_prob_repeat,
+            summarize_wsls,
+        )
+
+        def _norm_name(s: str) -> str:
+            import re
+            return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+        def _resolve_any(df: pd.DataFrame, candidates: list[str]) -> str | None:
+            nmap = {_norm_name(c): c for c in df.columns}
+            for cand in candidates:
+                hit = nmap.get(_norm_name(cand))
+                if hit is not None:
+                    return hit
+            return None
+
+        keys = DEFAULT_SESSION_KEYS
+        df = self.all_trials(experiment=experiment, paradigm=paradigm, treatment=treatment)
+
+        # Resolve the *actual* column names present in your data
+        real_well   = _resolve_any(df, [well_col, "well_on_ts"])
+        real_choice = _resolve_any(df, [choice_col, "well_id"])
+        real_err    = _resolve_any(df, [err_col, "error_flg"])
+
+        # Fall back to the provided names if not found (metrics will warn if still missing)
+        real_well   = real_well   or well_col
+        real_choice = real_choice or choice_col
+        real_err    = real_err    or err_col
+
+        perf = summarize_session_performance(df, keys=keys, prefer_wrong_flag=prefer_wrong_flag)
+        nr   = summarize_no_response_rate(df, keys=keys, well_col=real_well)
+        pr   = summarize_prob_right(df, keys=keys, choice_col=real_choice)
+        rep  = summarize_prob_repeat(df, keys=keys, choice_col=real_choice)
+        wsls = summarize_wsls(df, keys=keys, choice_col=real_choice, err_col=real_err)
+
+        out = perf.copy()
+        for sub in (nr, pr, rep, wsls):
+            out = out.merge(sub.drop(columns=[c for c in sub.columns if c == "num_trials"]),
+                            on=list(keys), how="left")
+        return out
 
 
 # =============================
