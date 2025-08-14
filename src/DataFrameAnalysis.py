@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt 
 from database.DataFrameDataBase import * 
 from analysis_helpers import *
+from mp_metrics import * 
 
 # Initialize the database: 
 study = StudyDataset.from_roots(
@@ -24,3 +25,5 @@ print([c for c in df.columns if "well" in c.lower() or "error" in c.lower()][:15
 dash = study.summarize_sessions(experiment="PFC_lesion", paradigm="normal")
 print(dash.filter(like="Prob").head())
 print(dash[["no_resp_rate"]].head())
+
+df = attach_performance_metrics_to_trials(df)

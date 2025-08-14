@@ -44,6 +44,28 @@ def _resolve_col(df: pd.DataFrame, name: str) -> str | None:
     nmap = {_norm_name(c): c for c in df.columns}
     return nmap.get(_norm_name(name))
 
+def _normalize_key_types(df: pd.DataFrame, keys) -> pd.DataFrame:
+    out = df.copy()
+    for k in keys:
+        if k == "_session_idx":
+            # nullable integer to handle any NaNs safely
+            out[k] = pd.to_numeric(out[k], errors="coerce").astype("Int64")
+        else:
+            # use pandas' nullable string dtype to keep NaNs as <NA>
+            out[k] = out[k].astype("string")
+    return out
+
+def _safe_left_merge(base: pd.DataFrame, summ: pd.DataFrame, keys) -> pd.DataFrame:
+    """
+    Merge `summ` into `base` on `keys`, but only bring in columns that
+    don't already exist in `base` (besides the keys).
+    """
+    existing = set(base.columns)
+    keyset   = set(keys)
+    # Only pull in keys plus truly new metric columns
+    newcols = [c for c in summ.columns if (c in keyset) or (c not in existing)]
+    return base.merge(summ[newcols], on=list(keys), how="left")
+
 
 # --------------------------
 # trial-level annotators
@@ -260,7 +282,12 @@ def add_block_id_by_bolus(
 
     # Block_number: count only non-'N' blocks, sequential per session
     is_real_block_start = (out["Block_id"] != "N") & block_grp2.ne(block_grp2.shift(1))
-    out["Block_number"] = _gdf(is_real_block_start.astype(int).to_frame("start"), keys)["start"].cumsum()
+    # out["Block_number"] = _gdf(is_real_block_start.astype(int).to_frame("start"), keys)["start"].cumsum()
+    out["Block_number"] = _gcol(
+        out.assign(__start=is_real_block_start.astype(int)),
+        "__start",
+        keys
+    ).cumsum()
     out.loc[out["Block_id"] == "N", "Block_number"] = np.nan
 
     return out
@@ -516,4 +543,93 @@ def summarize_wsls(
     out["ProbLoseSwitch"] = prob_ls.values
     out["ProbLoseStay"]   = prob_lstay.values
     out["ProbWinStay"]    = prob_wstay.values
+    return out
+
+# --------------------------
+# Convenience functions
+# --------------------------
+
+def attach_performance_metrics_to_trials(
+    df: pd.DataFrame,
+    *,
+    keys: Sequence[str] = DEFAULT_SESSION_KEYS,
+    prefer_wrong_flag: bool = False
+) -> pd.DataFrame:
+    """
+    Enrich a trial-level DataFrame with both per-trial and per-session performance metrics.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame of all trials with at least the columns in DEFAULT_SESSION_KEYS.
+    keys : sequence of str, optional
+        Column names used to identify a unique session, by default DEFAULT_SESSION_KEYS.
+    prefer_wrong_flag : bool, optional
+        Passed to summarize_session_performance.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copy of df with:
+        - Trial-level metrics added (NumRewards, reaction times, ITI, high-value well, block IDs)
+        - All session-level summaries merged back onto each trial
+    """
+    out = df.copy()
+
+    # Per-trial enrichments
+    out = add_num_rewards(out, prefer_counts=True)
+    out = add_reaction_response_times(out)
+    out = add_inter_trial_intervals(out, keys=keys)
+    out = add_high_value_well_from_bolus(out)
+    out = add_block_id_by_bolus(out, keys=keys)  # or add_block_id_by_prob
+
+    # # Session summaries
+    # perf   = summarize_session_performance(out, keys=keys, prefer_wrong_flag=prefer_wrong_flag)
+    # pright = summarize_prob_right(out, keys=keys)
+    # prept  = summarize_prob_repeat(out, keys=keys)
+    # wsls   = summarize_wsls(out, keys=keys)
+    # nrs    = summarize_no_response_rate(out, keys=keys)
+
+    # # --- normalize dtypes on keys for ALL frames ---
+    # out    = _normalize_key_types(out,    keys)
+    # perf   = _normalize_key_types(perf,   keys)
+    # pright = _normalize_key_types(pright, keys)
+    # prept  = _normalize_key_types(prept,  keys)
+    # wsls   = _normalize_key_types(wsls,   keys)
+    # nrs    = _normalize_key_types(nrs,    keys)
+
+    # # Merge summaries back
+    # for summ in (perf, pright, prept, wsls, nrs):
+    #     out = out.merge(summ, on=list(keys), how="left")
+
+    # --- session summaries ---
+    perf   = summarize_session_performance(out, keys=keys, prefer_wrong_flag=prefer_wrong_flag)
+    pright = summarize_prob_right(out, keys=keys)
+    prept  = summarize_prob_repeat(out, keys=keys)
+    wsls   = summarize_wsls(out, keys=keys)
+    nrs    = summarize_no_response_rate(out, keys=keys)
+
+    # (optional but recommended) normalize key dtypes
+    out    = _normalize_key_types(out,    keys)
+    perf   = _normalize_key_types(perf,   keys)
+    pright = _normalize_key_types(pright, keys)
+    prept  = _normalize_key_types(prept,  keys)
+    wsls   = _normalize_key_types(wsls,   keys)
+    nrs    = _normalize_key_types(nrs,    keys)
+
+    # If each summary carries a shared count column like 'NumTrials' or 'num_trials',
+    # keep the one from `perf` and drop it from the others to avoid collisions.
+    for s in (pright, prept, wsls, nrs):
+        for col in ("NumTrials", "num_trials", "n_trials"):
+            if col in s.columns:
+                s.drop(columns=[col], inplace=True)
+
+    # --- merges: bring in only *new* metrics each time ---
+    out = _safe_left_merge(out,    perf,   keys)   # keep perf's count columns
+    out = _safe_left_merge(out,    pright, keys)
+    out = _safe_left_merge(out,    prept,  keys)
+    out = _safe_left_merge(out,    wsls,   keys)
+    out = _safe_left_merge(out,    nrs,    keys)
+
+
     return out
